@@ -3,21 +3,26 @@
 #include <vector>
 #include <numeric>
 
-const int total_warehouses = 100000;
-const int num_ips_per_client = 3;
-const int client_repeat_count = 2;
+const int total_warehouses = 15000; // 100000 for 12xl
+const int num_ips_per_client = 6; // 3 for 12xl
+const int client_repeat_count = 1; // 2 for 12xl
 
-const int loader_threads = 60;
-
-const int num_connections = 300;
-const int delay = 120;
+const int loader_threads_per_client = 30; // 60 for 12xl
+const int num_connections_per_client = 600; // 300 for 12xl
+const int delay_per_client = 120; //
 
 using namespace std;
 
 void ReadClientIps(vector<string>& ips) {
   ifstream clients("yb_nodes.txt");
   string line;
+  int i = 0;
   while (getline(clients, line)) {
+    // skipping masters.
+    if (i < 3) {
+      i++;
+      continue;
+    }
     ips.emplace_back(line);
   }
 }
@@ -66,7 +71,7 @@ void OutputLoaderScripts(const vector<string>& ips) {
   int load_splits = ip_iterator.GetNumSplits();
   int warehouses_per_split = total_warehouses / load_splits;
 
-  cout << "LOAD SPLITS: " << load_splits << " WH per split " << warehouses_per_split << "\n";
+  cout << "LOAD SPLITS: " << load_splits << "\nWH per split " << warehouses_per_split << "\n";
   for (int i = 0; i < load_splits; ++i) {
     string filename = "loader" + to_string(i) + ".sh";
     ofstream load_output(filename.data());
@@ -75,7 +80,7 @@ void OutputLoaderScripts(const vector<string>& ips) {
                 << " --total-warehouses=" << total_warehouses
                 << " --warehouses=" << warehouses_per_split
                 << " --start-warehouse-id=" << i * warehouses_per_split + 1
-                << " --loaderthreads=" << loader_threads;
+                << " --loaderthreads=" << loader_threads_per_client;
   }
 }
 
@@ -83,8 +88,8 @@ void OutputExecuteScripts(const vector<string>& ips) {
   IpsIterator ip_iterator(ips, num_ips_per_client, client_repeat_count);
   int execute_splits = ip_iterator.GetNumSplits();
   int warehouses_per_split = total_warehouses / execute_splits;
-  int initial_delay = 0;
-  int warmup_time = execute_splits * delay - delay;
+  int initial_delay_per_client = 0;
+  int warmup_time = execute_splits * delay_per_client - delay_per_client;
 
   for (int i = 0; i < execute_splits; ++i) {
     string filename = "execute" + to_string(i) + ".sh";
@@ -92,14 +97,14 @@ void OutputExecuteScripts(const vector<string>& ips) {
 
     execute_output << "~/tpcc/tpccbenchmark --execute=true"
                    << " --nodes=" << ip_iterator.GetNext()
-                   << " --num-connections=" << num_connections
+                   << " --num-connections=" << num_connections_per_client
                    << " --total-warehouses=" << total_warehouses
                    << " --warehouses=" << warehouses_per_split
                    << " --start-warehouse-id=" << i * warehouses_per_split + 1
                    << " --warmup-time-secs=" << warmup_time
-                   << " --initial-delay-secs=" << initial_delay;
-    initial_delay += delay;
-    warmup_time -= delay;
+                   << " --initial-delay-secs=" << initial_delay_per_client;
+    initial_delay_per_client += delay_per_client;
+    warmup_time -= delay_per_client;
   }
 }
 

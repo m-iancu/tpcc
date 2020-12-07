@@ -1,4 +1,4 @@
-# This script creates the required tables on a cluster. 
+# This script creates the required tables on a cluster.
 # Arguments:
 # 1. Number warehouses
 # 2. IP of the master leader
@@ -10,10 +10,14 @@
 # The first sub-table is pinned to $cloud.$region.$zone2, the second to
 # $cloud.$region.$zone3 as the first zone is reserved for the yb-master.
 
-warehouses=${warehouses:-100}
+
+warehouses=${warehouses:-1000}
 ip=${ip:-127.0.0.1}
+master_addrs=${master_addrs:-127.0.0.1:7100}
 splits=${splits:-2}
 tablets=${tablets:-24}
+yugabyte_path=${yugabyte_path:-~/yugabyte/}
+
 while [ $# -gt 0 ]; do
    if [[ $1 == *"--"* ]]; then
         param="${1/--/}"
@@ -23,61 +27,85 @@ while [ $# -gt 0 ]; do
 done
 
 wh_per_split=$(expr $warehouses / $splits)
-ysqlsh="/mnt/d0/repositories/yugabyte-db3/bin/ysqlsh -h $ip"
-ybadmin="/mnt/d0/repositories/yugabyte-db3/build/debug-clang-dynamic/bin/yb-admin"
+ysqlsh="${yugabyte_path}/bin/ysqlsh -h $ip"
+ybadmin="${yugabyte_path}/bin/yb-admin --master_addresses $master_addrs"
 
+# TODO -- these should be config arguments
 cloud=aws
 region=us-west-2
-zone=us-west-2a
+zone=us-west-2b
 
 # $1: table_name
-# $2: argument list
-# $3: partition argument
-# $4: argument list without type
-# $5: PRIMARY key list
-create_table() {
-  if [[ $# == '3' ]]
-  then
-	$ysqlsh -d yugabyte -c "DROP TABLE IF EXISTS $1"
-	$ysqlsh -d yugabyte -c "CREATE TABLE $1 ($2, PRIMARY KEY($3)) SPLIT INTO 3 TABLETS"
-    tablezone=$zone$(( 1 ))
-    $ybadmin --master_addresses $ip:7100 modify_table_placement_info ysql.yugabyte $1 $cloud.$region.$tablezone 3
+# $2: column list
+# $3: primary key
+create_simple_table() {
+    tablezone="${zone}0"
+    $ybadmin modify_placement_info $cloud.$region.$tablezone 3
+    $ysqlsh -d yugabyte -c "DROP TABLE IF EXISTS $1"
+    $ysqlsh -d yugabyte -c "CREATE TABLE $1 ($2, PRIMARY KEY($3)) SPLIT INTO 3 TABLETS"
+    $ybadmin modify_table_placement_info ysql.yugabyte $1 $cloud.$region.$tablezone 3
     return
-  fi
+}
 
+# $1: table_name
+# $2: column list
+# $3: partition argument
+# $4: column list without type
+# $5: PRIMARY key list
+create_partitioned_table() {
+
+  # create parent table.
   $ysqlsh -d yugabyte -c "DROP TABLE IF EXISTS $1"
   $ysqlsh -d yugabyte -c "CREATE TABLE $1 ($2) PARTITION BY RANGE($3) SPLIT INTO 1 TABLETS"
 
-  if [[ $# == '4' ]]
+  # Only history table does not have a pkey.
+  pkey="";
+  if [[ $# == '5' ]]
   then
-  for i in `seq 1 $splits`;
-    do
-      start=$(( (i-1)*wh_per_split+1 ))
-      end=$(( (i*wh_per_split)+1  ))
-      $ysqlsh -d yugabyte -c "CREATE TABLE $1$i PARTITION OF $1($4) FOR VALUES FROM ($start) TO ($end) SPLIT INTO $tablets TABLETS";
-    done
-  else
-    for i in `seq 1 $splits`;
-    do
-      start=$(( (i-1)*wh_per_split+1 ))
-      end=$(( (i*wh_per_split)+1  ))
-      $ysqlsh -d yugabyte -c "CREATE TABLE $1$i PARTITION OF $1($4, PRIMARY KEY($5)) FOR VALUES FROM ($start) TO ($end) SPLIT INTO $tablets TABLETS";
-    done
+    pkey=", PRIMARY KEY($5)";
   fi
 
+  # create partitions
   for i in `seq 1 $splits`;
   do
-    tablezone=$zone$(( i+1 ))
-    $ybadmin --master_addresses $ip:7100 modify_table_placement_info ysql.yugabyte $1$i $cloud.$region.$tablezone 3
+    tablezone=$zone$(( i ))
+    $ybadmin modify_placement_info $cloud.$region.$tablezone 3
+
+    start=$(( (i-1)*wh_per_split+1 ))
+    end=$(( (i*wh_per_split)+1  ))
+    $ysqlsh -d yugabyte -c "CREATE TABLE $1$i PARTITION OF $1($4${pkey}) FOR VALUES FROM ($start) TO ($end) SPLIT INTO $tablets TABLETS";
+
+    $ybadmin modify_table_placement_info ysql.yugabyte $1$i $cloud.$region.$tablezone 3
   done
 }
 
-create_indexes() {
-  $ysqlsh -d yugabyte -c 'CREATE INDEX idx_customer_name ON customer ((c_w_id,c_d_id) HASH,c_last,c_first)'
-  $ysqlsh -d yugabyte -c 'CREATE UNIQUE INDEX idx_order ON oorder ((o_w_id,o_d_id) HASH,o_c_id,o_id DESC)'
+
+# $1 index name.
+# $2 table name.
+# $3 indexed colummns.
+# $4 is_unique
+create_index() {
+  for i in `seq 1 $splits`;
+  do
+    tablezone=$zone$(( i ))
+    $ybadmin modify_placement_info $cloud.$region.$tablezone 3
+
+    if [[ $4 == 0 ]]
+    then
+      $ysqlsh -d yugabyte -c "CREATE INDEX $1$i ON $2$i ($3)"
+    else
+      $ysqlsh -d yugabyte -c "CREATE UNIQUE INDEX $1$i ON $2$i ($3)"
+    fi
+
+    $ybadmin modify_table_placement_info ysql.yugabyte $1$i $cloud.$region.$tablezone 3
+  done
 }
 
-create_table 'item' \
+set -ex
+
+$ybadmin set_load_balancer_enabled 0
+
+create_simple_table 'item' \
              'i_id int NOT NULL,
               i_name varchar(24) NOT NULL,
               i_price decimal(5,2) NOT NULL,
@@ -85,8 +113,8 @@ create_table 'item' \
               i_im_id int NOT NULL' \
               'i_id'
 
-create_table 'warehouse' \
-             'w_id int NOT NULL, 
+create_partitioned_table 'warehouse' \
+             'w_id int NOT NULL,
               w_ytd decimal(12,2) NOT NULL,
               w_tax decimal(4,4) NOT NULL,
               w_name varchar(10) NOT NULL,
@@ -99,7 +127,7 @@ create_table 'warehouse' \
               'w_id, w_ytd, w_tax, w_name, w_street_1,  w_street_2, w_city, w_state, w_zip' \
               'w_id'
 
-create_table 'district' \
+create_partitioned_table 'district' \
              'd_w_id int NOT NULL,
               d_id int NOT NULL,
               d_ytd decimal(12,2) NOT NULL,
@@ -115,7 +143,7 @@ create_table 'district' \
              'd_w_id, d_id, d_ytd, d_tax, d_next_o_id, d_name, d_street_1, d_street_2, d_city, d_state, d_zip' \
              '(d_w_id,d_id) HASH'
 
-create_table 'customer' \
+create_partitioned_table 'customer' \
              'c_w_id int NOT NULL,
               c_d_id int NOT NULL,
               c_id int NOT NULL,
@@ -138,11 +166,11 @@ create_table 'customer' \
               c_middle char(2) NOT NULL,
               c_data varchar(500) NOT NULL' \
              'c_w_id' \
-             'c_w_id, c_d_id, c_id, c_discount, c_credit, c_last, c_first, c_credit_lim, c_balance, c_ytd_payment, c_payment_cnt, 
+             'c_w_id, c_d_id, c_id, c_discount, c_credit, c_last, c_first, c_credit_lim, c_balance, c_ytd_payment, c_payment_cnt,
               c_delivery_cnt, c_street_1, c_street_2, c_city, c_state, c_zip, c_phone, c_since, c_middle, c_data' \
              '(c_w_id,c_d_id) HASH,c_id' \
 
-create_table 'history' \
+create_partitioned_table 'history' \
              'h_c_id int NOT NULL,
               h_c_d_id int NOT NULL,
               h_c_w_id int NOT NULL,
@@ -154,7 +182,7 @@ create_table 'history' \
              'h_w_id' \
              'h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data'
 
-create_table 'oorder' \
+create_partitioned_table 'oorder' \
              'o_w_id int NOT NULL,
               o_d_id int NOT NULL,
               o_id int NOT NULL,
@@ -167,7 +195,7 @@ create_table 'oorder' \
              'o_w_id, o_d_id, o_id, o_c_id, o_carrier_id, o_ol_cnt, o_all_local, o_entry_d' \
              '(o_w_id,o_d_id) HASH,o_id'
 
-create_table 'stock' \
+create_partitioned_table 'stock' \
              's_w_id int NOT NULL,
               s_i_id int NOT NULL,
               s_quantity decimal(4,0) NOT NULL,
@@ -189,7 +217,7 @@ create_table 'stock' \
              's_w_id, s_i_id, s_quantity, s_ytd, s_order_cnt, s_remote_cnt, s_data, s_dist_01, s_dist_02, s_dist_03, s_dist_04, s_dist_05, s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10' \
              '(s_w_id,s_i_id)HASH' \
 
-create_table 'new_order' \
+create_partitioned_table 'new_order' \
              'no_w_id int NOT NULL,
               no_d_id int NOT NULL,
               no_o_id int NOT NULL' \
@@ -197,7 +225,7 @@ create_table 'new_order' \
              'no_w_id, no_d_id, no_o_id' \
              '(no_w_id,no_d_id) HASH,no_o_id'
 
-create_table 'order_line' \
+create_partitioned_table 'order_line' \
              'ol_w_id int NOT NULL,
               ol_d_id int NOT NULL,
               ol_o_id int NOT NULL,
@@ -212,5 +240,11 @@ create_table 'order_line' \
              'ol_w_id, ol_d_id, ol_o_id, ol_number, ol_i_id, ol_delivery_d, ol_amount, ol_supply_w_id, ol_quantity, ol_dist_info' \
              '(ol_w_id,ol_d_id) HASH,ol_o_id,ol_number'
 
-create_indexes
+create_index 'idx_customer_name' 'customer' '(c_w_id,c_d_id) HASH,c_last,c_first' 0
+
+create_index 'idx_order' 'oorder' '(o_w_id,o_d_id) HASH,o_c_id,o_id DESC' 1
+
+$ybadmin set_load_balancer_enabled 1
+
+
 
